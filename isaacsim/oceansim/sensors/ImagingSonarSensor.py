@@ -106,6 +106,14 @@ class ImagingSonarSensor(Camera):
         self.sonar_image = wp.zeros(shape=(self.r.shape[0], self.r.shape[1], 4), dtype=wp.uint8)
         self.gau_noise = wp.zeros(shape=self.r.shape, dtype=wp.float32)
         self.range_dependent_ray_noise = wp.zeros(shape=self.r.shape, dtype=wp.float32)
+        self._global_max = wp.zeros(shape=(1,), dtype=wp.float32)
+        self._range_max = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32)
+        self._point_capacity = 0
+        self._intensity = None
+        self._pcl_local = None
+        self._pcl_spher = None
+        self._index_to_prop_array = None
+        self._index_to_prop_key = None
 
         self.AR = self.hori_fov / self.vert_fov
         self.vert_res = int(self.hori_res / self.AR)
@@ -223,7 +231,37 @@ class ImagingSonarSensor(Camera):
         self.range_dependent_ray_noise.zero_()
         self.gau_noise.zero_()
 
-        
+    def _ensure_point_workspaces(self, num_points: int):
+        if (
+            self._intensity is not None
+            and self._pcl_local is not None
+            and self._pcl_spher is not None
+            and num_points <= self._point_capacity
+        ):
+            return
+
+        self._point_capacity = num_points
+        self._intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        self._pcl_local = wp.empty(shape=(num_points,), dtype=wp.vec3)
+        self._pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
+
+    def _get_index_to_prop_array(self, id_to_labels: dict, query_property: str):
+        cache_key = tuple(
+            (int(semantic_id), float(properties.get(query_property, 1.0)))
+            for semantic_id, properties in sorted(id_to_labels.items(), key=lambda item: int(item[0]))
+        )
+        if self._index_to_prop_array is not None and cache_key == self._index_to_prop_key:
+            return self._index_to_prop_array
+
+        max_id = max((int(semantic_id) for semantic_id in id_to_labels.keys()), default=-1)
+        index_to_prop_array = np.ones((max_id + 1,), dtype=np.float32)
+        for semantic_id, properties in id_to_labels.items():
+            if query_property in properties:
+                index_to_prop_array[int(semantic_id)] = float(properties[query_property])
+
+        self._index_to_prop_key = cache_key
+        self._index_to_prop_array = wp.array(index_to_prop_array, dtype=wp.float32)
+        return self._index_to_prop_array
 
     def scan(self):
 
@@ -240,15 +278,22 @@ class ImagingSonarSensor(Camera):
         # Due to the time to load annotator to cuda, the first few simulation tick gives no annotation in memory.
         # This would also reult error when no mesh within the sonar fov
         # Ignore scan that gives empty data stream
-        if len(self.semanticSeg_annot.get_data()['info']['idToLabels']) !=0:
-            self.scan_data['pcl'] = self.pointcloud_annot.get_data(device=self._device)['data'][0]  # shape :(1,N,3) <class 'warp.types.array'>
-            self.scan_data['normals'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointNormals'][0] # shape :(1,N,4) <class 'warp.types.array'>
-            self.scan_data['semantics'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointSemantic'][0] # shape: (1, N) <class 'warp.types.array'>
-            self.scan_data['viewTransform'] = self.cameraParams_annot.get_data()['cameraViewTransform'].reshape(4,4).T # 4 by 4 np.ndarray extrinsic matrix
-            self.scan_data['idToLabels'] = self.semanticSeg_annot.get_data()['info']['idToLabels'] # dict 
-            return True
-        else:
+        semantic_seg_data = self.semanticSeg_annot.get_data()
+        id_to_labels = semantic_seg_data.get('info', {}).get('idToLabels', {})
+        if len(id_to_labels) == 0:
             return False
+
+        pointcloud_data = self.pointcloud_annot.get_data(device=self._device)
+        pointcloud = pointcloud_data['data'][0]
+        if pointcloud.shape[0] == 0:
+            return False
+
+        self.scan_data['pcl'] = pointcloud  # shape :(N,3) <class 'warp.types.array'>
+        self.scan_data['normals'] = pointcloud_data['info']['pointNormals'][0] # shape :(N,4) <class 'warp.types.array'>
+        self.scan_data['semantics'] = pointcloud_data['info']['pointSemantic'][0] # shape: (N,) <class 'warp.types.array'>
+        self.scan_data['viewTransform'] = self.cameraParams_annot.get_data()['cameraViewTransform'].reshape(4,4).T # 4 by 4 np.ndarray extrinsic matrix
+        self.scan_data['idToLabels'] = id_to_labels # dict 
+        return True
 
 
     def make_sonar_data(self, 
@@ -284,37 +329,22 @@ class ImagingSonarSensor(Camera):
 
 
 
-        def make_indexToProp_array(idToLabels: dict, query_property: str):
-            # A utility function helps to convert idToLabels into indexToProp array
-            # This manipulation facilitates warp computation framework
-            # indexToProp is an 1-dim array where the values associated with the query property 
-            # are placed at the index corresponding to the key
-            # First two entry are always zero because {'0': {'class': 'BACKGROUND'}, '1': {'class': 'UNLABELLED'}}
-            # eg: indexToProp = [0, 0, 0.1, 1 .....] 
-            max_id = max(idToLabels.keys(), default=-1)
-            indexToProp_array = np.ones((int(max_id)+1,))
-            for id in idToLabels.keys():
-                for property in idToLabels.get(id):
-                    if property == query_property:
-                        indexToProp_array[int(id)] = idToLabels.get(id).get(property)
-            return indexToProp_array
-
-        if self.scan():
-            num_points = self.scan_data['pcl'].shape[0]
-            # Load these small numpy arrays to cuda
-            indexToRefl = wp.array(make_indexToProp_array(idToLabels=self.scan_data['idToLabels'],
-                                                         query_property=query_prop),
-                                                         dtype=wp.float32)
-            viewTransform=wp.mat44(self.scan_data['viewTransform'])
-            # directly use warp array loaded on cuda
-            pcl = self.scan_data['pcl']
-            normals = self.scan_data['normals']
-            semantics = self.scan_data['semantics']
-        else:
+        if not self.scan():
             return
 
-        # Compute intensity for each ray query     
-        intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        num_points = self.scan_data['pcl'].shape[0]
+        self._ensure_point_workspaces(num_points)
+        indexToRefl = self._get_index_to_prop_array(
+            id_to_labels=self.scan_data['idToLabels'],
+            query_property=query_prop,
+        )
+        viewTransform = wp.mat44(self.scan_data['viewTransform'])
+        # directly use warp array loaded on cuda
+        pcl = self.scan_data['pcl']
+        normals = self.scan_data['normals']
+        semantics = self.scan_data['semantics']
+
+        # Compute intensity for each ray query
         wp.launch(kernel=compute_intensity,
                   dim=num_points,
                   inputs=[
@@ -326,13 +356,11 @@ class ImagingSonarSensor(Camera):
                       attenuation,
                   ],
                   outputs=[
-                      intensity
+                      self._intensity
                   ]
                 )
-                
+
         # Transform pointcloud from world cooridates to sonar local
-        pcl_local =wp.empty(shape=(num_points,), dtype=wp.vec3)
-        pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
         wp.launch(kernel=world2local,
                   dim=num_points,
                   inputs=[
@@ -340,8 +368,8 @@ class ImagingSonarSensor(Camera):
                       pcl
                   ],
                     outputs=[
-                      pcl_local,
-                      pcl_spher
+                      self._pcl_local,
+                      self._pcl_spher
                     ]
                 )
         
@@ -355,8 +383,8 @@ class ImagingSonarSensor(Camera):
         wp.launch(kernel=bin_intensity,
                   dim=num_points,
                   inputs=[
-                      pcl_spher,
-                      intensity,
+                      self._pcl_spher,
+                      self._intensity,
                       self.min_range,
                       self.min_azi,
                       self.range_res,
@@ -430,7 +458,7 @@ class ImagingSonarSensor(Camera):
         # Normalizing intensity at each bin either by global maximum or rangewise maximum
         # Compute global maximum
         if normalizing_method == "all":
-            maximum = wp.zeros(shape=(1,), dtype=wp.float32)
+            self._global_max.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=all_max,
@@ -438,7 +466,7 @@ class ImagingSonarSensor(Camera):
                     self.binned_intensity,
                 ],
                 outputs=[
-                    maximum # wp.array of shape (1,), max value is stored at maximum[0]
+                    self._global_max # wp.array of shape (1,), max value is stored at maximum[0]
                 ]
             )
             
@@ -450,7 +478,7 @@ class ImagingSonarSensor(Camera):
                       self.r,
                       self.azi,
                       self.binned_intensity,
-                      maximum,
+                      self._global_max,
                       self.gau_noise,
                       self.range_dependent_ray_noise,
                       intensity_offset,
@@ -463,7 +491,7 @@ class ImagingSonarSensor(Camera):
             
         if normalizing_method == "range":
             # Compute rangewise maximum
-            maximum = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32)
+            self._range_max.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=range_max,
@@ -471,7 +499,7 @@ class ImagingSonarSensor(Camera):
                     self.binned_intensity,
                 ],
                 outputs=[
-                    maximum      # wp.array of shape (number of range bins, )
+                    self._range_max      # wp.array of shape (number of range bins, )
                 ]
             )
             # Apply noise, normalize by range maximum, and convert (r, azi) to (x,y) for plotting
@@ -482,7 +510,7 @@ class ImagingSonarSensor(Camera):
                       self.r,
                       self.azi, 
                       self.binned_intensity,
-                      maximum,
+                      self._range_max,
                       self.gau_noise,
                       self.range_dependent_ray_noise,
                       intensity_offset,
@@ -615,6 +643,12 @@ class ImagingSonarSensor(Camera):
         rep.AnnotatorCache.clear(self.cameraParams_annot)
         rep.AnnotatorCache.clear(self.semanticSeg_annot)
 
+        self._intensity = None
+        self._pcl_local = None
+        self._pcl_spher = None
+        self._index_to_prop_array = None
+        self._index_to_prop_key = None
+        self._point_capacity = 0
 
         print(f'[{self._name}] Annotator detached. AnnotatorCache cleaned.')
 
@@ -631,3 +665,6 @@ class ImagingSonarSensor(Camera):
         """
         for elem in self.wrapped_ui_elements:
             elem.destroy()
+        self.wrapped_ui_elements = []
+        self._window = None
+        self._sonar_provider = None

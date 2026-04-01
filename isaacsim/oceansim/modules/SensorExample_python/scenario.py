@@ -9,6 +9,11 @@ from isaacsim.core.utils.xforms import get_world_pose
 
 from ...utils.hydrodynamics import UnderwaterHydrodynamics
 
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except Exception:
+    _debug_draw = None
+
 
 class MHL_Sensor_Example_Scenario():
     def __init__(self):
@@ -33,6 +38,17 @@ class MHL_Sensor_Example_Scenario():
         self._manual_backend_disabled = False
         self._last_world_position = None
         self._last_world_orientation = None
+        self._trajectory_draw = None
+        self._trajectory_points = []
+        self._trajectory_color = (0.25, 1.0, 0.25, 1.0)
+        self._trajectory_width = 4.0
+        self._trajectory_min_step = 0.05
+        self._trajectory_max_points = 2000
+        self._trajectory_max_length = 8.0
+        self._trajectory_min_alpha = 0.08
+        self._trajectory_enabled = True
+        self._trajectory_warned_unavailable = False
+        self._reset_trajectory()
 
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode):
         self._rob = rob
@@ -47,6 +63,7 @@ class MHL_Sensor_Example_Scenario():
         self._manual_backend_disabled = False
         self._last_world_position = None
         self._last_world_orientation = None
+        self._reset_trajectory()
         if self._sonar is not None:
             self._sonar.sonar_initialize(include_unlabelled=True)
         if self._cam is not None:
@@ -70,14 +87,14 @@ class MHL_Sensor_Example_Scenario():
             rob_rigid_body_api.GetLinearDampingAttr().Set(0.0)
             rob_rigid_body_api.GetAngularDampingAttr().Set(0.0)
             self._hydrodynamics = UnderwaterHydrodynamics(
-                angular_command_tau=0.08,
-                angular_drag=np.array([4.0, 4.0, 3.0]),
-                quadratic_angular_drag=np.array([1.2, 1.2, 1.0]),
-                attitude_stiffness=np.array([0.0, 0.0, 0.0]),
-                attitude_damping=np.array([0.8, 0.8, 0.0]),
-                max_angular_velocity=np.array([2.0, 2.0, 1.8]),
-                max_smoothed_torque_cmd=np.array([10.0, 10.0, 10.0]),
-                max_total_torque=np.array([12.0, 12.0, 10.0]),
+                angular_command_tau=0.14,
+                angular_drag=np.array([5.5, 5.5, 4.2]),
+                quadratic_angular_drag=np.array([1.8, 1.8, 1.4]),
+                attitude_stiffness=np.array([2.2, 2.2, 0.0]),
+                attitude_damping=np.array([1.4, 1.4, 0.0]),
+                max_angular_velocity=np.array([1.1, 1.1, 1.0]),
+                max_smoothed_torque_cmd=np.array([4.5, 4.5, 4.0]),
+                max_total_torque=np.array([7.0, 7.0, 5.5]),
             )
             self._force_cmd = keyboard_cmd(base_command=np.array([0.0, 0.0, 0.0]),
                                       input_keyboard_mapping={
@@ -97,17 +114,17 @@ class MHL_Sensor_Example_Scenario():
             self._torque_cmd = keyboard_cmd(base_command=np.array([0.0, 0.0, 0.0]),
                                       input_keyboard_mapping={
                                         # yaw command (left)
-                                        "J": [0.0, 0.0, 8.0],
+                                        "J": [0.0, 0.0, 4.0],
                                         # yaw command (right)
-                                        "L": [0.0, 0.0, -8.0],
+                                        "L": [0.0, 0.0, -4.0],
                                         # pitch command (up)
-                                        "I": [0.0, -8.0, 0.0],
+                                        "I": [0.0, -3.2, 0.0],
                                         # pitch command (down)
-                                        "K": [0.0, 8.0, 0.0],
+                                        "K": [0.0, 3.2, 0.0],
                                         # row command (left)
-                                        "LEFT": [-8.0, 0.0, 0.0],
+                                        "LEFT": [-2.8, 0.0, 0.0],
                                         # row command (negative)
-                                        "RIGHT": [8.0, 0.0, 0.0],
+                                        "RIGHT": [2.8, 0.0, 0.0],
                                       })
             self.set_manual_control_enabled(False)
             
@@ -231,6 +248,91 @@ class MHL_Sensor_Example_Scenario():
         self._last_world_orientation = world_orientation
         return world_orientation, linear_velocity, angular_velocity, state_source
 
+    def _reset_trajectory(self):
+        self._trajectory_points = []
+        if self._trajectory_draw is not None:
+            try:
+                self._trajectory_draw.clear_lines()
+            except Exception:
+                pass
+        if _debug_draw is None:
+            self._trajectory_draw = None
+            return
+        try:
+            self._trajectory_draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception as exc:
+            self._trajectory_draw = None
+            if not self._trajectory_warned_unavailable:
+                print(f"[OceanSim Trajectory] debug draw unavailable: {exc}")
+                self._trajectory_warned_unavailable = True
+
+    def _trim_trajectory_points(self):
+        if len(self._trajectory_points) <= 2:
+            return
+
+        while len(self._trajectory_points) > self._trajectory_max_points:
+            self._trajectory_points.pop(0)
+
+        total_length = 0.0
+        segment_lengths = []
+        for start_point, end_point in zip(self._trajectory_points[:-1], self._trajectory_points[1:]):
+            segment_length = float(
+                np.linalg.norm(np.array(end_point, dtype=np.float64) - np.array(start_point, dtype=np.float64))
+            )
+            segment_lengths.append(segment_length)
+            total_length += segment_length
+
+        while total_length > self._trajectory_max_length and len(self._trajectory_points) > 2:
+            total_length -= segment_lengths.pop(0)
+            self._trajectory_points.pop(0)
+
+    def _update_trajectory_draw(self):
+        if not self._trajectory_enabled or self._trajectory_draw is None or self._rob_prim_path is None:
+            return
+
+        try:
+            world_position, _ = get_world_pose(self._rob_prim_path)
+        except Exception:
+            return
+
+        point = tuple(float(value) for value in world_position)
+        if self._trajectory_points:
+            prev = np.array(self._trajectory_points[-1], dtype=np.float64)
+            curr = np.array(point, dtype=np.float64)
+            if np.linalg.norm(curr - prev) < self._trajectory_min_step:
+                return
+
+        self._trajectory_points.append(point)
+        self._trim_trajectory_points()
+
+        if len(self._trajectory_points) < 2:
+            return
+
+        start_points = self._trajectory_points[:-1]
+        end_points = self._trajectory_points[1:]
+        segment_count = len(start_points)
+        base_r, base_g, base_b, _ = self._trajectory_color
+        if segment_count == 1:
+            colors = [(base_r, base_g, base_b, 1.0)]
+        else:
+            colors = [
+                (
+                    base_r,
+                    base_g,
+                    base_b,
+                    self._trajectory_min_alpha + (1.0 - self._trajectory_min_alpha) * (index / (segment_count - 1)),
+                )
+                for index in range(segment_count)
+            ]
+        sizes = [self._trajectory_width] * segment_count
+        try:
+            self._trajectory_draw.clear_lines()
+            self._trajectory_draw.draw_lines(start_points, end_points, colors, sizes)
+        except Exception as exc:
+            if not self._trajectory_warned_unavailable:
+                print(f"[OceanSim Trajectory] draw failed: {exc}")
+                self._trajectory_warned_unavailable = True
+
     # This function will only be called if ctrl_mode==waypoints and waypoints files are changed
     def setup_waypoints(self, waypoint_path, default_waypoint_path):
         def read_data_from_file(file_path):
@@ -277,6 +379,7 @@ class MHL_Sensor_Example_Scenario():
             if self._torque_cmd is not None:
                 self._torque_cmd.cleanup()
 
+        self._reset_trajectory()
         self._rob = None
         self._sonar = None
         self._cam = None
@@ -359,9 +462,4 @@ class MHL_Sensor_Example_Scenario():
             if rigid_prim is not None:
                 rigid_prim.set_linear_velocity(np.array([0.5,0,0])) 
 
-
-
-
-        
-
-        
+        self._update_trajectory_draw()
