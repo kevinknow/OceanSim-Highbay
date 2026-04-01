@@ -4,7 +4,7 @@ import os
 import omni.timeline
 import omni.ui as ui
 from omni.usd import StageEventType
-from pxr import PhysxSchema, Gf, Usd, UsdPhysics, UsdShade
+from pxr import PhysxSchema, Gf, Sdf, Usd, UsdPhysics, UsdShade
 import carb
 
 # Isaac sim import
@@ -238,6 +238,7 @@ class UIBuilder():
         self._rov_override_metallic = 0.82
 
         # Sensor
+        self._rob = None
         self._sonar = None
         self._sonar_trans = np.array([0.3,0.0, 0.3])
         self._cam = None
@@ -247,6 +248,9 @@ class UIBuilder():
         self._DVL_trans = np.array([0,0,-0.1])
         self._baro = None
         self._water_surface = 1.43389 # Arbitrary
+        self._USD_path_field = None
+        self._scenario_state_btn = None
+        self._reset_btn = None
         self._waypoints_path_field = None
         
         # Scenario
@@ -274,17 +278,56 @@ class UIBuilder():
         if viewport_window is not None:
             viewport_window.focus()
 
-    def _ensure_robot_selected(self):
-        if self._rob is None:
-            return
-
-        robot_prim_path = self._rob.GetPath().pathString
+    def _clear_selection(self):
         selection = omni.usd.get_context().get_selection()
-        selected_paths = selection.get_selected_prim_paths()
-        if selected_paths:
+        if selection is None:
+            return
+        try:
+            selection.clear_selected_prim_paths()
+        except Exception:
+            pass
+
+    def _ensure_robot_selected(self):
+        stage = get_current_stage()
+        selection = omni.usd.get_context().get_selection()
+        if selection is None:
             return
 
-        selection.set_selected_prim_paths([robot_prim_path], True)
+        selected_paths = selection.get_selected_prim_paths() or []
+        valid_selected_paths = []
+        selection_changed = False
+        for selected_path in selected_paths:
+            if isinstance(selected_path, str):
+                path_str = selected_path
+            elif hasattr(selected_path, "pathString"):
+                path_str = selected_path.pathString
+                selection_changed = True
+            else:
+                path_str = str(selected_path)
+                selection_changed = True
+
+            if not path_str:
+                selection_changed = True
+                continue
+            try:
+                sdf_path = Sdf.Path(path_str)
+            except Exception:
+                selection_changed = True
+                continue
+            if not sdf_path.IsAbsolutePath():
+                selection_changed = True
+                continue
+            if stage is not None and not stage.GetPrimAtPath(sdf_path).IsValid():
+                selection_changed = True
+                continue
+            valid_selected_paths.append(path_str)
+
+        if not selection_changed and valid_selected_paths == list(selected_paths):
+            return
+
+        self._clear_selection()
+        if valid_selected_paths:
+            selection.set_selected_prim_paths(valid_selected_paths, False)
 
     def _focus_viewport_next_frame(self):
         if self._focus_viewport_sub is not None:
@@ -300,7 +343,8 @@ class UIBuilder():
         )
 
     def _set_runtime_text_inputs_enabled(self, enabled: bool):
-        self._USD_path_field.enabled = enabled
+        if self._USD_path_field is not None:
+            self._USD_path_field.enabled = enabled
         if self._waypoints_path_field is not None:
             self._waypoints_path_field.enabled = enabled
 
@@ -574,6 +618,8 @@ class UIBuilder():
         On pressing the Load Button, a new instance of World() is created and then this function is called.
         The user should now load their assets onto the stage and add them to the World Scene.
         """
+        self._clear_selection()
+
         if self._USD_path_field.get_value() != "":
             user_scene_path = os.path.expanduser(self._USD_path_field.get_value().replace("\\", "/"))
             user_scene_name = os.path.basename(user_scene_path)
@@ -749,9 +795,11 @@ class UIBuilder():
         self._reset_ui()
 
     def _reset_ui(self):
-        self._scenario_state_btn.reset()
-        self._scenario_state_btn.enabled = False
-        self._reset_btn.enabled = False
+        if self._scenario_state_btn is not None:
+            self._scenario_state_btn.reset()
+            self._scenario_state_btn.enabled = False
+        if self._reset_btn is not None:
+            self._reset_btn.enabled = False
         self._set_runtime_text_inputs_enabled(True)
 
 
